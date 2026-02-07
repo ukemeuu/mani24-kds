@@ -5,7 +5,10 @@ import { INITIAL_ORDERS, ICONS, SHIFT_HOURS, STAFF_USERS } from './constants';
 import OrderCard from './components/OrderCard';
 import ChefInsightsPanel from './components/ChefInsightsPanel';
 import DailyReportModal from './components/DailyReportModal';
+import OrderEntryModal from './components/OrderEntryModal';
+import OrderHistoryDashboard from './components/OrderHistoryDashboard';
 import { getChefInsights, generateSimulatedOrder } from './services/geminiService';
+import OnboardingScreen from './components/OnboardingScreen';
 
 declare global {
   interface AIStudio {
@@ -25,6 +28,11 @@ import { supabase } from './supabaseClient';
 const KDS_SYNC_CHANNEL = new BroadcastChannel('pj_kds_sync'); // Keep for local fallback or remove if fully replacing
 
 const App: React.FC = () => {
+  // Multi-tenancy State
+  const [tenantId, setTenantId] = useState<string | null>(localStorage.getItem('kds_tenant_id'));
+  const [tenantName, setTenantName] = useState<string | null>(localStorage.getItem('kds_tenant_name'));
+  const [staffUsers, setStaffUsers] = useState<StaffUser[]>([]);
+
   const [userRole, setUserRole] = useState<UserRole | null>(null);
   const [orders, setOrders] = useState<Order[]>([]); // Initialize empty, fetch from DB
   const [activeStation, setActiveStation] = useState<StationType>('FRONT_DESK');
@@ -36,6 +44,7 @@ const App: React.FC = () => {
   const [showOrderModal, setShowOrderModal] = useState(false);
   const [showBulkConfirm, setShowBulkConfirm] = useState(false);
   const [showReport, setShowReport] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
 
   const [insights, setInsights] = useState<ChefInsight[]>([]);
   const [sources, setSources] = useState<any[]>([]);
@@ -59,6 +68,45 @@ const App: React.FC = () => {
   const soundReady = useRef(new Audio('https://assets.mixkit.co/active_storage/sfx/951/951-preview.mp3'));
   const soundNewOrder = useRef(new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3'));
 
+  const handleOnboardingComplete = (id: string, name: string) => {
+    localStorage.setItem('kds_tenant_id', id);
+    localStorage.setItem('kds_tenant_name', name);
+    setTenantId(id);
+    setTenantName(name);
+  };
+
+  const handleSignOutTenant = () => {
+    if (confirm('Are you sure you want to sign out of this restaurant?')) {
+      localStorage.removeItem('kds_tenant_id');
+      localStorage.removeItem('kds_tenant_name');
+      setTenantId(null);
+      setTenantName(null);
+      setUserRole(null);
+      setOrders([]);
+    }
+  };
+
+  useEffect(() => {
+    if (!tenantId || !supabase) return;
+
+    // Fetch Staff for Tenant
+    const fetchStaff = async () => {
+      const { data } = await supabase.from('staff').select('*').eq('tenant_id', tenantId);
+      if (data && data.length > 0) {
+        setStaffUsers(data.map(s => ({
+          id: s.id,
+          name: s.name,
+          role: s.role as UserRole,
+          pin: s.pin
+        })));
+      } else {
+        // Fallback to constants if no staff found (migration phase)
+        setStaffUsers(STAFF_USERS);
+      }
+    };
+    fetchStaff();
+  }, [tenantId]);
+
   useEffect(() => {
     if (!supabase) return;
 
@@ -67,6 +115,7 @@ const App: React.FC = () => {
       const { data, error } = await supabase
         .from('orders')
         .select('*, items:order_items(*)')
+        .eq('tenant_id', tenantId)
         .order('created_at', { ascending: true });
 
       if (data) {
@@ -85,8 +134,11 @@ const App: React.FC = () => {
             name: i.name,
             quantity: i.quantity,
             category: i.category,
-            estimatedPrepTime: i.estimated_prep_time
-          })) || []
+            estimatedPrepTime: i.estimated_prep_time,
+            notes: i.notes
+          })) || [],
+          prepStartedAt: o.prep_started_at,
+          metadata: o.metadata
         }));
         setOrders(formattedOrders);
       }
@@ -116,7 +168,7 @@ const App: React.FC = () => {
     return () => {
       supabase.removeChannel(channel);
     };
-  }, []);
+  }, [tenantId]);
 
   const broadcast = (type: string, payload: any) => {
     KDS_SYNC_CHANNEL.postMessage({ type, payload });
@@ -177,7 +229,8 @@ const App: React.FC = () => {
         return {
           ...order,
           status: newStatus,
-          dispatchedAt: newStatus === OrderStatus.DISPATCHED ? Date.now() : order.dispatchedAt
+          dispatchedAt: newStatus === OrderStatus.DISPATCHED ? Date.now() : order.dispatchedAt,
+          prepStartedAt: newStatus === OrderStatus.PREPARING && !order.prepStartedAt ? Date.now() : order.prepStartedAt
         };
       }
       return order;
@@ -189,7 +242,34 @@ const App: React.FC = () => {
       const updates: any = { status: newStatus };
       if (newStatus === OrderStatus.DISPATCHED) updates.dispatched_at = Date.now();
 
+      // If moving to PREPARING, set prep_started_at if not already set
+      if (newStatus === OrderStatus.PREPARING) {
+        // We might need to check if it's already set to avoid overwriting, 
+        // but simpler to strictly set it only if we want to reset or just trust the backend.
+        // Better logic: send prep_started_at only if it's null in DB? 
+        // For now, let's just send current time.
+        updates.prep_started_at = Date.now();
+      }
+
+
       await supabase.from('orders').update(updates).eq('id', orderId);
+
+      // Verify if it's a Glovo order and sync status
+      const order = orders.find(o => o.id === orderId);
+      if (order?.metadata?.source === 'glovo' && order.metadata.glovo_order_id && order.metadata.store_id) {
+        try {
+          await supabase.functions.invoke('update-glovo-status', {
+            body: {
+              orderId: order.id,
+              glovoOrderId: order.metadata.glovo_order_id,
+              storeId: order.metadata.store_id,
+              status: newStatus
+            }
+          });
+        } catch (error) {
+          console.error('Failed to sync status with Glovo:', error);
+        }
+      }
     }
 
     if (newStatus === OrderStatus.READY) playSound(soundReady);
@@ -264,6 +344,7 @@ const App: React.FC = () => {
             type: newOrderInfo.type,
             status: 'NEW',
             created_at: createdAt,
+            tenant_id: tenantId,
             metadata: {}
           })
           .select()
@@ -483,75 +564,7 @@ const App: React.FC = () => {
     );
   };
 
-  const OrderEntryModal = () => {
-    const [name, setName] = useState('');
-    const [type, setType] = useState<'Dine-in' | 'Takeout' | 'Delivery'>('Dine-in');
 
-    const addQuickOrder = async () => {
-      if (!name) return;
-
-      if (supabase) {
-        setSimulationLoading(true);
-        const createdAt = Date.now();
-        const { data: orderData, error } = await supabase.from('orders').insert({
-          order_number: `PJ-${Math.floor(100 + Math.random() * 899)}`,
-          customer_name: name,
-          type: type,
-          status: 'NEW',
-          created_at: createdAt
-        }).select().single();
-
-        if (error) {
-          console.error('Error creating order:', error);
-          setSimulationLoading(false);
-          return;
-        }
-
-        if (orderData) {
-          const { error: itemsError } = await supabase.from('order_items').insert([
-            { order_id: orderData.id, name: 'Party Jollof Rice', quantity: 1, category: 'Main', estimated_prep_time: 12 },
-            { order_id: orderData.id, name: 'Fried Plantain (Dodo)', quantity: 1, category: 'Side', estimated_prep_time: 5 }
-          ]);
-
-          if (itemsError) console.error('Error creating items:', itemsError);
-        }
-        setSimulationLoading(false);
-      }
-
-      playSound(soundNewOrder);
-      setShowOrderModal(false);
-    };
-
-    return (
-      <div className="fixed inset-0 z-[120] bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
-        <div className="bg-zinc-900 border-2 border-brand-yellow rounded-3xl w-full max-w-lg p-8 shadow-2xl animate-in zoom-in duration-200">
-          <div className="flex justify-between items-center mb-6">
-            <h2 className="text-3xl font-black text-brand-yellow tracking-tighter">POS / PUNCH ORDER</h2>
-            <button onClick={() => setShowOrderModal(false)} className="text-zinc-500 hover:text-white">
-              <svg className="w-8 h-8" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" /></svg>
-            </button>
-          </div>
-          <div className="space-y-6">
-            <div className="space-y-2">
-              <label className="text-[10px] font-black uppercase text-zinc-500">Customer Name</label>
-              <input autoFocus placeholder="Enter customer name..." value={name} onChange={e => setName(e.target.value)} className="w-full bg-black border border-zinc-800 p-4 rounded-2xl font-bold text-xl focus:outline-none focus:border-brand-yellow" />
-            </div>
-            <div className="space-y-2">
-              <label className="text-[10px] font-black uppercase text-zinc-500">Order Type</label>
-              <div className="grid grid-cols-3 gap-2">
-                {(['Dine-in', 'Takeout', 'Delivery'] as const).map(t => (
-                  <button key={t} onClick={() => setType(t)} className={`py-4 rounded-2xl font-black text-xs transition-all ${type === t ? 'bg-brand-yellow text-black' : 'bg-zinc-800 text-zinc-500'}`}>{t.toUpperCase()}</button>
-                ))}
-              </div>
-            </div>
-          </div>
-          <div className="mt-8 flex gap-4">
-            <button disabled={!name} onClick={addQuickOrder} className={`flex-grow py-5 bg-brand-yellow text-black font-black rounded-2xl text-xl shadow-lg shadow-brand-yellow/20 active:scale-95 transition-all ${!name ? 'opacity-50 cursor-not-allowed' : ''}`}>CREATE TICKET</button>
-          </div>
-        </div>
-      </div>
-    );
-  };
 
   const BulkConfirmModal = () => (
     <div className="fixed inset-0 z-[150] bg-black/90 backdrop-blur-md flex items-center justify-center p-4">
@@ -573,7 +586,7 @@ const App: React.FC = () => {
     if (!selectedAuthRole) return;
 
     // Find User by Role and PIN
-    const foundUser = STAFF_USERS.find(u => u.role === selectedAuthRole && u.pin === authPin);
+    const foundUser = staffUsers.find(u => u.role === selectedAuthRole && u.pin === authPin);
 
     if (!foundUser) {
       setAuthError('Invalid PIN');
@@ -654,12 +667,16 @@ const App: React.FC = () => {
     );
   };
 
+  if (!tenantId) {
+    return <OnboardingScreen onComplete={handleOnboardingComplete} />;
+  }
+
   if (!userRole) {
     return (
       <div className="fixed inset-0 z-[300] bg-black flex flex-col items-center justify-center p-6 text-center">
         <div className="max-w-4xl w-full">
           <div className="bg-brand-yellow w-24 h-24 rounded-3xl flex items-center justify-center mx-auto mb-10 rotate-12 shadow-2xl shadow-brand-yellow/20">
-            <span className="text-black font-black text-5xl">PJ</span>
+            <span className="text-black font-black text-5xl">M24</span>
           </div>
           <h1 className="text-5xl font-black text-white mb-4 tracking-tighter">STAFF IDENTITY</h1>
           <p className="text-zinc-500 font-bold uppercase tracking-widest text-sm mb-16">Select your workstation to begin your shift</p>
@@ -686,7 +703,7 @@ const App: React.FC = () => {
     return (
       <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black p-6">
         <div className="max-w-md w-full p-10 bg-zinc-900 rounded-3xl border border-zinc-800 text-center shadow-2xl">
-          <div className="bg-brand-yellow w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-8 rotate-12"><span className="text-black font-black text-4xl">PJ</span></div>
+          <div className="bg-brand-yellow w-20 h-20 rounded-3xl flex items-center justify-center mx-auto mb-8 rotate-12"><span className="text-black font-black text-4xl">M24</span></div>
           <h1 className="text-3xl font-black mb-4">API KEY REQUIRED</h1>
           <p className="text-zinc-400 mb-8 font-medium">Please connect your Gemini API key to access real-time kitchen insights and order simulation.</p>
           <button onClick={() => window.aistudio?.openSelectKey()} className="w-full py-5 bg-brand-yellow text-black font-black rounded-2xl text-lg hover:scale-105 transition-all shadow-xl shadow-brand-yellow/20">SELECT API KEY</button>
@@ -701,8 +718,8 @@ const App: React.FC = () => {
         <header className="h-20 flex items-center justify-between px-8 bg-zinc-900/80 backdrop-blur-xl border-b border-zinc-800 shrink-0 z-[60]">
           <div className="flex items-center gap-8">
             <div className="flex items-center gap-3">
-              <div className="bg-brand-yellow p-2 rounded-xl"><span className="text-black font-black text-xl leading-none">PJ</span></div>
-              <h1 className="font-black text-lg tracking-tighter hidden sm:block">{currentUser?.name || 'POT OF JOLLOF'}</h1>
+              <div className="bg-brand-yellow p-2 rounded-xl"><span className="text-black font-black text-xl leading-none">M24</span></div>
+              <h1 className="font-black text-lg tracking-tighter hidden sm:block">{currentUser?.name || 'Mani24 KDS'}</h1>
             </div>
             <nav className="flex bg-black/50 p-1.5 rounded-2xl border border-zinc-800">
               {availableStations.map(s => (
@@ -719,6 +736,7 @@ const App: React.FC = () => {
                 <div className="flex items-center gap-2">
                   <span className="text-[9px] font-black text-brand-yellow uppercase tracking-widest">Logged in as:</span>
                   <button onClick={() => setUserRole(null)} className="text-[9px] font-black text-zinc-500 hover:text-white uppercase transition-colors">(Switch Staff)</button>
+                  <button onClick={handleSignOutTenant} className="text-[9px] font-black text-zinc-500 hover:text-red-500 uppercase transition-colors ml-2">(Switch Restaurant)</button>
                 </div>
                 <p className="font-black text-xs uppercase tracking-tighter text-white">{userRole?.replace('_', ' ')}</p>
               </div>
@@ -729,6 +747,10 @@ const App: React.FC = () => {
               <SortToggle />
             </div>
             <div className="flex items-center gap-4">
+              <button onClick={() => setShowHistory(true)} className="px-4 py-2.5 bg-zinc-800 text-zinc-300 border border-zinc-700 rounded-xl font-black text-[10px] hover:bg-zinc-700 transition-all flex items-center gap-2">
+                <svg className="w-4 h-4 text-brand-yellow" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" /></svg>
+                HISTORY
+              </button>
               <button onClick={() => setShowReport(true)} className="px-4 py-2.5 bg-zinc-800 text-zinc-300 border border-zinc-700 rounded-xl font-black text-[10px] hover:bg-zinc-700 transition-all flex items-center gap-2">
                 <svg className="w-4 h-4 text-brand-yellow" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" /></svg>
                 DAILY REPORT
@@ -746,6 +768,12 @@ const App: React.FC = () => {
                 </div>
               )}
               <div className="text-right border-l border-zinc-800 pl-6 flex flex-col justify-center">
+                <button
+                  onClick={() => { setUserRole(null); setCurrentUser(null); }}
+                  className="text-[10px] font-black text-red-500 hover:text-red-400 uppercase tracking-widest mb-1 transition-colors"
+                >
+                  SIGN OUT
+                </button>
                 <p className="text-2xl font-mono font-black tracking-tighter text-brand-yellow leading-none">{currentTime.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</p>
                 <div className="flex items-center gap-1.5 justify-end mt-1">
                   <div className={`w-1.5 h-1.5 rounded-full ${isSyncing ? 'bg-green-500 animate-ping' : 'bg-zinc-700'}`}></div>
@@ -827,9 +855,17 @@ const App: React.FC = () => {
         <ChefInsightsPanel insights={insights} sources={sources} loading={insightsLoading} onRefresh={refreshInsights} error={quotaError} />
       )}
 
-      {showOrderModal && <OrderEntryModal />}
+      {showOrderModal && (
+        <OrderEntryModal
+          onClose={() => setShowOrderModal(false)}
+          playSound={() => playSound(soundNewOrder)}
+          setSimulationLoading={setSimulationLoading}
+          tenantId={tenantId!}
+        />
+      )}
       {showBulkConfirm && <BulkConfirmModal />}
       {showReport && <DailyReportModal orders={orders} onClose={() => setShowReport(false)} />}
+      {showHistory && <OrderHistoryDashboard orders={orders} onClose={() => setShowHistory(false)} />}
     </div>
   );
 };

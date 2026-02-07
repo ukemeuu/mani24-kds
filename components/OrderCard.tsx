@@ -24,12 +24,38 @@ const QUICK_MENU = [
 
 const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, onStatusChange, onTypeChange, onUpdateOrder, onDeleteItem }) => {
   const [minutesElapsed, setMinutesElapsed] = useState(Math.floor((Date.now() - order.createdAt) / 60000));
+  const [prepMinutesElapsed, setPrepMinutesElapsed] = useState(order.prepStartedAt ? Math.floor((Date.now() - order.prepStartedAt) / 60000) : 0);
   const [isUpdated, setIsUpdated] = useState(false);
   const [isEditing, setIsEditing] = useState(false);
+
+  // Calculate dynamic target prep time
+  const mainItemsCount = order.items.reduce((sum, item) => sum + (item.category === 'Main' ? item.quantity : 0), 0);
+  const totalItemsCount = order.items.reduce((sum, item) => sum + item.quantity, 0);
+
+  // Rule: 1-3 items (12m), 4-6 items (18m), >6 items (25m)
+  // Using total items count as a proxy effectively, or should we stick to main items? 
+  // User said "orders with main items 1-3... up to 6... more than 6 items". 
+  // I will use total main items count for this logic as per request "orders with main items".
+  const targetPrepTime = mainItemsCount > 6 ? 25 : mainItemsCount >= 4 ? 18 : 12;
+
+  // Timer Updates
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setMinutesElapsed(Math.floor((Date.now() - order.createdAt) / 60000));
+      if (order.status === OrderStatus.PREPARING && order.prepStartedAt) {
+        setPrepMinutesElapsed(Math.floor((Date.now() - order.prepStartedAt) / 60000));
+      }
+    }, 1000); // Updated to 1s for smoother feel, though minutes only change every 60s
+    return () => clearInterval(interval);
+  }, [order.createdAt, order.prepStartedAt, order.status]);
+
+  const isPrepDelayed = order.status === OrderStatus.PREPARING && prepMinutesElapsed > targetPrepTime;
+
+  // ... [Keep existing state initialization] ...
   const [editOrder, setEditOrder] = useState<Order>(order);
   const [confirmingDeleteId, setConfirmingDeleteId] = useState<string | null>(null);
   const [flashingItemId, setFlashingItemId] = useState<string | null>(null);
-  
+
   // Inline Note State
   const [editingNoteItemId, setEditingNoteItemId] = useState<string | null>(null);
   const [tempNoteValue, setTempNoteValue] = useState('');
@@ -53,12 +79,6 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
 
   const soundNewOrderRef = useRef(new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3'));
 
-  useEffect(() => {
-    const interval = setInterval(() => {
-      setMinutesElapsed(Math.floor((Date.now() - order.createdAt) / 60000));
-    }, 30000);
-    return () => clearInterval(interval);
-  }, [order.createdAt]);
 
   useEffect(() => {
     if (prevStatus.current !== order.status || prevType.current !== order.type) {
@@ -70,6 +90,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
     }
   }, [order.status, order.type]);
 
+  // ... [Keep effects for resetting state on order change] ...
   useEffect(() => {
     if (!isEditing) {
       setEditOrder(order);
@@ -83,7 +104,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
   useEffect(() => {
     if (order.status === OrderStatus.NEW && !isMuted && !hasPlayedNewSound.current) {
       soundNewOrderRef.current.currentTime = 0;
-      soundNewOrderRef.current.play().catch(() => {});
+      soundNewOrderRef.current.play().catch(() => { });
       hasPlayedNewSound.current = true;
     }
     if (order.status !== OrderStatus.NEW) {
@@ -103,9 +124,11 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
   const isPacking = order.status === OrderStatus.PACKING;
   const isDispatched = order.status === OrderStatus.DISPATCHED;
 
+  // Update urgency logic to include prep delay
   const getUrgencyColor = () => {
     if (isDispatched) return 'bg-zinc-900/40 border-zinc-800 opacity-90';
     if (isReady && activeStation === 'FRONT_DESK') return 'bg-green-700 border-green-500 shadow-lg';
+    if (isPrepDelayed) return 'bg-red-800 border-red-500 shadow-xl animate-pulse'; // Prep Delayed takes precedence
     if (isDelayed) return 'bg-red-700 border-red-500 shadow-xl';
     if (isCritical) return 'bg-red-600 border-red-500 shadow-lg';
     if (isWarning) return 'bg-orange-500 border-orange-400 shadow-md';
@@ -122,11 +145,10 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
     return (
       <button
         onClick={() => onTypeChange(order.id, type)}
-        className={`px-2 py-0.5 text-[9px] font-black uppercase tracking-tighter transition-all rounded cursor-pointer ${
-          isActive 
-            ? (isReady || isDispatched) ? 'bg-black text-brand-yellow shadow-inner' : 'bg-brand-yellow text-black' 
-            : 'text-zinc-500 hover:text-white hover:bg-white/10 active:scale-95'
-        }`}
+        className={`px-2 py-0.5 text-[9px] font-black uppercase tracking-tighter transition-all rounded cursor-pointer ${isActive
+          ? (isReady || isDispatched) ? 'bg-black text-brand-yellow shadow-inner' : 'bg-brand-yellow text-black'
+          : 'text-zinc-500 hover:text-white hover:bg-white/10 active:scale-95'
+          }`}
       >
         {label}
       </button>
@@ -263,27 +285,29 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
   return (
     <div className={`flex flex-col border-2 rounded-xl overflow-hidden transition-all duration-300 relative 
       ${getUrgencyColor()} 
-      ${isDelayed || isCritical ? 'animate-critical' : ''} 
+      ${isDelayed || isCritical || isPrepDelayed ? 'animate-critical' : ''} 
       ${isReady ? 'ring-4 ring-brand-yellow animate-ready-shimmer z-10' : ''}
       ${isUpdated ? 'animate-status-change' : ''}`}>
-      
+
       {isReady && (
         <div className="absolute inset-0 z-0 pointer-events-none overflow-hidden rounded-xl">
           <div className="absolute top-0 bottom-0 w-[40%] bg-gradient-to-r from-transparent via-white/10 to-transparent animate-shimmer-sweep" />
         </div>
       )}
-      
-      {isDelayed && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-red-600 text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse shadow-sm ring-2 ring-red-500">DELAYED</span></div>}
-      {!isDelayed && isCritical && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-red-600 text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse shadow-sm">CRITICAL</span></div>}
+
+      {isPrepDelayed && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-red-600 text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse shadow-sm ring-2 ring-red-500">PREP DELAY</span></div>}
+      {!isPrepDelayed && isDelayed && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-red-600 text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse shadow-sm ring-2 ring-red-500">DELAYED</span></div>}
+      {!isPrepDelayed && !isDelayed && isCritical && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-red-600 text-[10px] font-black px-2 py-0.5 rounded-full animate-pulse shadow-sm">CRITICAL</span></div>}
       {isPacking && <div className="absolute top-2 right-2 z-10"><span className="bg-brand-yellow text-black text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm">PACKING</span></div>}
       {isReady && <div className="absolute top-2 right-2 z-10"><span className="bg-white text-black text-[10px] font-black px-2 py-0.5 rounded-full shadow-sm border border-brand-yellow animate-pulse">READY</span></div>}
 
       <div className={`p-3 flex justify-between items-start transition-colors duration-300 relative z-10
-        ${isReady ? 'bg-brand-yellow text-black' : 
-          isDelayed ? 'bg-red-800 text-white' : 
-          isCritical ? 'bg-red-700 text-white' : 
-          isWarning ? 'bg-orange-600 text-white' : 
-          isDispatched ? 'bg-zinc-800/50 text-zinc-400' : 'bg-zinc-900 text-white'}`}>
+        ${isReady ? 'bg-brand-yellow text-black' :
+          isPrepDelayed ? 'bg-red-900 text-white' :
+            isDelayed ? 'bg-red-800 text-white' :
+              isCritical ? 'bg-red-700 text-white' :
+                isWarning ? 'bg-orange-600 text-white' :
+                  isDispatched ? 'bg-zinc-800/50 text-zinc-400' : 'bg-zinc-900 text-white'}`}>
         <div className="flex flex-col flex-grow min-w-0 pr-4">
           <div className="flex items-center gap-2">
             <h3 className="font-black text-xl leading-none tracking-tight">{order.orderNumber}</h3>
@@ -294,7 +318,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
             )}
           </div>
           <div className="mt-2 flex flex-col gap-1.5">
-            <span className="text-[10px] font-black uppercase flex items-center gap-1 opacity-90"><ICONS.Clock /> Load: {totalSumPrepTime}m</span>
+            <span className="text-[10px] font-black uppercase flex items-center gap-1 opacity-90"><ICONS.Clock /> Total Items: {totalItemsCount}</span>
             <div className={`flex items-center p-0.5 rounded-md gap-0.5 w-fit ${isReady || isDispatched ? 'bg-black/60 border border-brand-yellow/20' : 'bg-black/40 border border-zinc-800'}`}>
               <OrderTypeSegment type="Dine-in" label="DINE" />
               <OrderTypeSegment type="Takeout" label="TO-GO" />
@@ -302,7 +326,25 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
             </div>
           </div>
         </div>
-        <div className={`flex items-center gap-1 font-mono font-bold text-2xl ${isDelayed || isCritical ? 'animate-pulse' : ''}`}><span>{minutesElapsed}m</span></div>
+        <div className="flex flex-col items-end gap-1">
+          {/* Timer 1: Total Time */}
+          <div className={`flex items-center gap-1 font-mono font-bold text-lg ${isDelayed ? 'animate-pulse text-red-300' : ''}`}>
+            <span className="text-[9px] uppercase font-black opacity-60 mr-1">T.Time</span>
+            <span>{minutesElapsed}m</span>
+          </div>
+
+          {/* Timer 2: Prep Time */}
+          {order.status !== OrderStatus.NEW && (
+            <div className={`flex items-center gap-1 font-mono font-bold text-lg ${isPrepDelayed ? 'animate-pulse text-red-300' : ''}`}>
+              <span className="text-[9px] uppercase font-black opacity-60 mr-1">Prep</span>
+              <span>{prepMinutesElapsed}m</span>
+              <span className="text-[9px] text-white/50">/ {targetPrepTime}m</span>
+            </div>
+          )}
+          {order.status === OrderStatus.NEW && (
+            <div className="text-[9px] uppercase font-black opacity-50 bg-white/10 px-2 py-1 rounded">Wait Start</div>
+          )}
+        </div>
       </div>
 
       <div className="p-4 flex-grow space-y-3 bg-brand-dark/60 backdrop-blur-sm overflow-y-auto max-h-[400px] relative z-10">
@@ -321,8 +363,8 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                 <p className="text-[8px] font-black text-zinc-600 uppercase">Quick Add</p>
                 <div className="grid grid-cols-2 gap-2">
                   {QUICK_MENU.map(item => (
-                    <button 
-                      key={item.name} 
+                    <button
+                      key={item.name}
                       onClick={() => handleQuickSelect(item)}
                       className={`px-2 py-2 text-[9px] font-black text-left rounded-lg border border-zinc-800 hover:border-brand-yellow/50 transition-colors ${newItem.name === item.name ? 'bg-brand-yellow/10 border-brand-yellow text-brand-yellow' : 'bg-zinc-900 text-zinc-400'}`}
                     >
@@ -333,22 +375,22 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
               </div>
 
               <div className="space-y-3 pt-2">
-                <input 
-                  autoFocus 
-                  placeholder="Item Name..." 
-                  value={newItem.name} 
-                  onChange={e => setNewItem({...newItem, name: e.target.value})} 
-                  className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2.5 text-xs font-bold text-white focus:outline-none focus:border-brand-yellow" 
+                <input
+                  autoFocus
+                  placeholder="Item Name..."
+                  value={newItem.name}
+                  onChange={e => setNewItem({ ...newItem, name: e.target.value })}
+                  className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2.5 text-xs font-bold text-white focus:outline-none focus:border-brand-yellow"
                 />
-                
+
                 <div className="grid grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <label className="text-[8px] font-black text-zinc-600 uppercase">Quantity</label>
-                    <input type="number" min="1" value={newItem.quantity} onChange={e => setNewItem({...newItem, quantity: parseInt(e.target.value) || 1})} className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2 text-xs font-bold text-white focus:outline-none" />
+                    <input type="number" min="1" value={newItem.quantity} onChange={e => setNewItem({ ...newItem, quantity: parseInt(e.target.value) || 1 })} className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2 text-xs font-bold text-white focus:outline-none" />
                   </div>
                   <div className="space-y-1">
                     <label className="text-[8px] font-black text-zinc-600 uppercase">Prep (min)</label>
-                    <input type="number" min="1" value={newItem.estimatedPrepTime} onChange={e => setNewItem({...newItem, estimatedPrepTime: parseInt(e.target.value) || 10})} className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2 text-xs font-bold text-white focus:outline-none" />
+                    <input type="number" min="1" value={newItem.estimatedPrepTime} onChange={e => setNewItem({ ...newItem, estimatedPrepTime: parseInt(e.target.value) || 10 })} className="w-full bg-black border border-zinc-800 rounded-lg px-3 py-2 text-xs font-bold text-white focus:outline-none" />
                   </div>
                 </div>
 
@@ -356,9 +398,9 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                   <label className="text-[8px] font-black text-zinc-600 uppercase">Category</label>
                   <div className="flex gap-1">
                     {['Main', 'Side', 'Drink'].map(cat => (
-                      <button 
-                        key={cat} 
-                        onClick={() => setNewItem({...newItem, category: cat as any})}
+                      <button
+                        key={cat}
+                        onClick={() => setNewItem({ ...newItem, category: cat as any })}
                         className={`flex-grow py-2 rounded-lg text-[9px] font-black uppercase transition-all ${newItem.category === cat ? 'bg-brand-yellow text-black' : 'bg-zinc-900 text-zinc-600 border border-zinc-800'}`}
                       >
                         {cat}
@@ -369,8 +411,8 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
               </div>
             </div>
 
-            <button 
-              onClick={handleAddItem} 
+            <button
+              onClick={handleAddItem}
               disabled={!newItem.name}
               className={`mt-4 w-full py-4 bg-brand-yellow text-black font-black rounded-xl text-xs uppercase shadow-lg shadow-brand-yellow/10 transition-all active:scale-95 ${!newItem.name ? 'opacity-50 cursor-not-allowed' : ''}`}
             >
@@ -382,20 +424,20 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
         {isEditing ? (
           <div className="space-y-1">
             <label className="text-[10px] text-zinc-500 font-bold uppercase">Customer Name</label>
-            <input type="text" value={editOrder.customerName} onChange={(e) => setEditOrder({...editOrder, customerName: e.target.value})} className="w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-brand-yellow" />
+            <input type="text" value={editOrder.customerName} onChange={(e) => setEditOrder({ ...editOrder, customerName: e.target.value })} className="w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1.5 text-sm font-bold text-white focus:outline-none focus:border-brand-yellow" />
           </div>
         ) : (
           <div className="flex items-center gap-2 text-zinc-300"><ICONS.User /><span className={`text-sm font-bold truncate ${isDispatched ? 'text-zinc-500' : ''}`}>{order.customerName}</span></div>
         )}
-        
+
         <div className="space-y-2 pt-2">
           {editOrder.items.map((item, index) => (
-            <div 
-              key={item.id} 
-              draggable={isEditing} 
-              onDragStart={() => handleDragStart(index)} 
-              onDragOver={(e) => handleDragOver(e, index)} 
-              onDrop={() => handleDrop(index)} 
+            <div
+              key={item.id}
+              draggable={isEditing}
+              onDragStart={() => handleDragStart(index)}
+              onDragOver={(e) => handleDragOver(e, index)}
+              onDrop={() => handleDrop(index)}
               onDragEnd={handleDragEnd}
               onDragLeave={(e) => {
                 // Only reset if we're actually leaving the element, not just entering a child
@@ -417,7 +459,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                     </div>
 
                     <div className="flex flex-col items-center bg-black rounded-lg border border-brand-yellow overflow-hidden">
-                      <button 
+                      <button
                         onClick={() => handleUpdateQuantity(item.id, 1)}
                         className="w-full py-1.5 bg-brand-yellow text-black hover:bg-yellow-400 active:bg-yellow-500 flex items-center justify-center"
                       >
@@ -426,14 +468,14 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                       <div className="px-2 py-1 bg-black text-white text-xs font-black">
                         {item.quantity}
                       </div>
-                      <button 
+                      <button
                         onClick={() => handleUpdateQuantity(item.id, -1)}
                         className="w-full py-1.5 bg-zinc-800 text-brand-yellow hover:bg-zinc-700 active:bg-zinc-600 flex items-center justify-center"
                       >
                         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M20 12H4" /></svg>
                       </button>
                     </div>
-                    
+
                     {confirmingDeleteId === item.id ? (
                       <div className="flex flex-col gap-1 mt-2">
                         <button onClick={() => handleConfirmDelete(item.id)} className="p-1.5 bg-red-600 text-white rounded-lg animate-pulse">
@@ -454,17 +496,17 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                 )}
                 <div className="min-w-0 flex-grow">
                   <p className={`font-bold leading-tight ${isDispatched ? 'text-zinc-600' : 'text-zinc-100'}`}>{item.name}</p>
-                  
+
                   {/* Notes Section - Refactored for Inline Editing */}
                   <div className="mt-1.5">
                     {isEditing ? (
                       <div className="space-y-1.5">
-                        <input 
-                          type="text" 
-                          placeholder="Instructions..." 
-                          value={item.notes || ''} 
-                          onChange={(e) => handleItemEdit(item.id, 'notes', e.target.value)} 
-                          className="w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 focus:outline-none focus:border-brand-yellow" 
+                        <input
+                          type="text"
+                          placeholder="Instructions..."
+                          value={item.notes || ''}
+                          onChange={(e) => handleItemEdit(item.id, 'notes', e.target.value)}
+                          className="w-full bg-zinc-900 border border-zinc-800 rounded px-2 py-1 text-[10px] text-zinc-300 focus:outline-none focus:border-brand-yellow"
                         />
                         <div className="flex items-center gap-1.5">
                           <span className="text-[8px] font-black uppercase text-zinc-600">Prep(m):</span>
@@ -473,7 +515,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                       </div>
                     ) : editingNoteItemId === item.id ? (
                       <div className="p-2 rounded-lg bg-black border border-brand-yellow animate-in fade-in duration-200">
-                        <textarea 
+                        <textarea
                           autoFocus
                           value={tempNoteValue}
                           onChange={(e) => setTempNoteValue(e.target.value)}
@@ -486,7 +528,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                         </div>
                       </div>
                     ) : item.notes ? (
-                      <div 
+                      <div
                         onClick={() => handleStartEditNote(item)}
                         className="group relative cursor-pointer p-2 rounded-md bg-brand-yellow/10 border border-brand-yellow/30 hover:bg-brand-yellow/20 transition-colors"
                       >
@@ -497,7 +539,7 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
                       </div>
                     ) : (
                       !isDispatched && (
-                        <button 
+                        <button
                           onClick={() => handleStartEditNote(item)}
                           className="text-[9px] font-black text-zinc-700 hover:text-brand-yellow flex items-center gap-1 transition-colors uppercase tracking-widest"
                         >
@@ -512,8 +554,8 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
           ))}
 
           {isEditing && (
-            <button 
-              onClick={() => setShowAddItemModal(true)} 
+            <button
+              onClick={() => setShowAddItemModal(true)}
               className="w-full py-3 border border-dashed border-brand-yellow/40 rounded-xl text-brand-yellow text-[10px] font-black uppercase hover:bg-brand-yellow/10 transition-colors flex items-center justify-center gap-2 mt-4"
             >
               <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={3} d="M12 4v16m8-8H4" /></svg>
@@ -526,14 +568,14 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
       <div className="p-2 bg-zinc-900 flex flex-col gap-2 mt-auto relative z-10">
         {isEditing ? (
           <div className="flex gap-2">
-            <button 
-              onClick={handleSaveEdit} 
+            <button
+              onClick={handleSaveEdit}
               className="flex-grow py-3 bg-brand-yellow text-black font-black rounded-lg hover:bg-yellow-400 active:scale-95 transition-all shadow-lg shadow-brand-yellow/20 uppercase text-[10px] tracking-widest"
             >
               SAVE CHANGES
             </button>
-            <button 
-              onClick={handleCancelEdit} 
+            <button
+              onClick={handleCancelEdit}
               className="px-6 py-3 bg-zinc-800 text-zinc-400 font-black rounded-lg hover:bg-zinc-700 transition-all border border-zinc-700 uppercase text-[10px] tracking-widest"
             >
               CANCEL
@@ -542,8 +584,11 @@ const OrderCard: React.FC<OrderCardProps> = ({ order, activeStation, isMuted, on
         ) : action ? (
           <button onClick={() => onStatusChange(order.id, action.next)} className={`w-full py-3 text-black font-black rounded-lg shadow-lg active:scale-95 transition-all ${isReady ? 'bg-green-500 hover:bg-green-400' : 'bg-brand-yellow hover:bg-yellow-400'}`}>{action.label}</button>
         ) : (
-          activeStation === 'FRONT_DESK' && (order.status === OrderStatus.NEW || order.status === OrderStatus.PREPARING) && (
-            <button onClick={() => setIsEditing(true)} className="w-full py-3 bg-zinc-800 text-brand-yellow font-black rounded-lg shadow-lg active:scale-95 transition-all hover:bg-zinc-700 border border-brand-yellow/20">EDIT TICKET</button>
+          activeStation === 'FRONT_DESK' && (order.status === OrderStatus.NEW || order.status === OrderStatus.PREPARING || order.status === OrderStatus.PACKING) && (
+            <div className="flex gap-2 w-full">
+              <button onClick={() => onStatusChange(order.id, OrderStatus.READY)} className="flex-1 py-3 bg-zinc-800 text-green-500 font-black rounded-lg shadow-lg active:scale-95 transition-all hover:bg-zinc-700 border border-green-500/20 text-[10px] uppercase tracking-widest">MARK READY</button>
+              <button onClick={() => setIsEditing(true)} className="flex-1 py-3 bg-zinc-800 text-brand-yellow font-black rounded-lg shadow-lg active:scale-95 transition-all hover:bg-zinc-700 border border-brand-yellow/20 text-[10px] uppercase tracking-widest">EDIT</button>
+            </div>
           )
         )}
       </div>

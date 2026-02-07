@@ -2,9 +2,11 @@
 export enum OrderStatus {
   NEW = 'NEW',
   PREPARING = 'PREPARING',
-  PACKING = 'PACKING',
   READY = 'READY',
-  DISPATCHED = 'DISPATCHED'
+  DSTACHED = 'DISPATCHED',
+  SERVED = 'SERVED',
+  DISPATCHED = 'DISPATCHED',
+  PACKING = 'PACKING'
 }
 
 export type StationType = 'FRONT_DESK' | 'CHEF' | 'PACKER';
@@ -36,7 +38,9 @@ export interface Order {
   status: OrderStatus;
   createdAt: number;
   dispatchedAt?: number; // timestamp when status became DISPATCHED
+  prepStartedAt?: number;
   tableNumber?: string;
+  metadata?: any;
   groundingSources?: { title: string; uri: string }[];
 }
 

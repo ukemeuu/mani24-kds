@@ -11,6 +11,7 @@ create table if not exists public.orders (
   status text not null, -- 'NEW', 'PREPARING', 'READY', 'SERVED'
   created_at bigint not null,
   dispatched_at bigint,
+  prep_started_at bigint,
   metadata jsonb
 );
 
