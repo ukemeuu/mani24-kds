@@ -1,0 +1,7 @@
+{
+  "name": "Copy of Pot of Jollof Kitchen KDS",
+  "description": "A high-performance Kitchen Display System for Pot of Jollof Kitchen, featuring real-time order tracking, AI-powered chef insights, and a bold black and yellow aesthetic.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
